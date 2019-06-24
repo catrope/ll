@@ -20,7 +20,8 @@
  * @param {ll.Translator} [translator] Translator object
  */
 ll.Prism = function LLPrism( firstOptions, secondOptions, translator ) {
-	var prism = this;
+	var tx1, tx2,
+		prism = this;
 
 	function makeSurface( lang, dir, html, store ) {
 		var doc = ve.dm.converter.getModelFromDom(
@@ -31,9 +32,10 @@ ll.Prism = function LLPrism( firstOptions, secondOptions, translator ) {
 		return new ve.dm.Surface( doc, doc.getDocumentNode(), { sourceMode: false } );
 	}
 	// TODO use one target with two surfaces? But then they'd share one toolbar, do we want that?
-	this.firstSurface = makeSurface( firstOptions.lang, firstOptions.dir, firstOptions.html );
+	this.store = new ve.dm.HashValueStore();
+	this.firstSurface = makeSurface( firstOptions.lang, firstOptions.dir, firstOptions.html, this.store );
 	this.firstDoc = this.firstSurface.getDocument();
-	this.secondSurface = makeSurface( secondOptions.lang, secondOptions.dir, secondOptions.html, this.firstDoc.getStore() );
+	this.secondSurface = makeSurface( secondOptions.lang, secondOptions.dir, secondOptions.html, this.store );
 	this.secondDoc = this.secondSurface.getDocument();
 	this.firstDoc.other = this.secondDoc;
 	this.secondDoc.other = this.firstDoc;
@@ -49,6 +51,22 @@ ll.Prism = function LLPrism( firstOptions, secondOptions, translator ) {
 		} );
 	}, 50 );
 	this.firstDoc.storeApprovedDescendants( this.firstDoc.getDocumentNode() );
+	this.completeHistory = new ve.dm.Change( 0, [], [], {} );
+	// Use the same store inside the completeHistory
+	this.completeHistory.store = this.store;
+	// Doc lengths at each history point
+	this.firstDocLength = [];
+	this.secondDocLength = [];
+	if ( this.store.getLength() > 0 ) {
+		// Push the initial store, with an identity transaction pair
+		tx1 = new ve.dm.Transaction(
+			[ { type: 'retain', length: this.firstDoc.data.data.length } ]
+		);
+		tx2 = new ve.dm.Transaction(
+			[ { type: 'retain', length: this.secondDoc.data.data.length } ]
+		);
+		this.pushCompleteHistory( tx1, tx2 );
+	}
 };
 
 /* Initialize */
@@ -56,6 +74,64 @@ ll.Prism = function LLPrism( firstOptions, secondOptions, translator ) {
 OO.initClass( ll.Prism );
 
 /* Instance methods */
+
+/**
+ * Push atomic transaction pair onto the complete history
+ *
+ * Each transaction is extended with retains to apply to the concatenated linmod of
+ * firstDoc and secondDoc (with an extra item in the middle so insertions to the end of
+ * firstDoc / start of secondDoc are not ambiguous).
+ *
+ * Each transaction is pushed separately, because pushing the concatenation of both as a
+ * single transaction would cause extra rebasing conflicts.
+ *
+ * TODO: the two resulting transactions should be a single atomic change
+ *
+ * @param {ve.dm.Transaction|null} [tx1] Transaction on firstDoc
+ * @param {ve.dm.Transaction|null} [tx2] Corresponding transaction on secondDoc
+ */
+ll.Prism.prototype.pushCompleteHistory = function ( tx1, tx2 ) {
+	var info1, info2;
+	if ( tx1 ) {
+		info1 = tx1.getLengthAndDiff();
+	} else {
+		info1 = {
+			length: this.firstDocLength[ this.firstDocLength.length - 1 ] || 0,
+			diff: 0
+		};
+	}
+	if ( tx2 ) {
+		info2 = tx2.getLengthAndDiff();
+	} else {
+		info2 = {
+			length: this.secondDocLength[ this.secondDocLength.length - 1 ] || 0,
+			diff: 0
+		};
+	}
+
+	if ( tx1 ) {
+		this.completeHistory.pushTransaction( new ve.dm.Transaction(
+			[].concat(
+				tx1.operations,
+				{ type: 'retain', length: 1 },
+				{ type: 'retain', length: info2.length }
+			)
+		) );
+		this.firstDocLength.push( info1.length + info1.diff );
+		this.secondDocLength.push( info2.length );
+	}
+	if ( tx2 ) {
+		this.completeHistory.pushTransaction( new ve.dm.Transaction(
+			[].concat(
+				{ type: 'retain', length: info1.length },
+				{ type: 'retain', length: 1 },
+				tx2.operations
+			)
+		) );
+		this.firstDocLength.push( info1.length + info1.diff );
+		this.secondDocLength.push( info2.length + info2.diff );
+	}
+};
 
 /**
  * Distort an applied translation for the other doc, and apply it
@@ -66,11 +142,24 @@ OO.initClass( ll.Prism );
  */
 ll.Prism.prototype.applyDistorted = function ( doc, otherDoc, tx ) {
 	var distortion;
+	if ( tx.isEcho ) {
+		return;
+	}
 	if ( tx.noEcho ) {
+		if ( doc === this.firstDoc ) {
+			this.pushCompleteHistory( tx, null );
+		} else {
+			this.pushCompleteHistory( null, tx );
+		}
 		return;
 	}
 	distortion = tx.distort( doc, otherDoc );
 	otherDoc.commit( distortion.tx );
+	if ( doc === this.firstDoc ) {
+		this.pushCompleteHistory( tx, distortion.tx );
+	} else {
+		this.pushCompleteHistory( distortion.tx, tx );
+	}
 	ll.setTimeout( this.flagDirty.bind( this, distortion.changedNodePairs ) );
 	this.throttledMaybeTranslate( doc, otherDoc );
 };
